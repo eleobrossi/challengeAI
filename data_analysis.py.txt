@@ -1,8 +1,12 @@
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
 # Load data
-df = pd.read_csv("The_Truman_Show_train\\public\\transactions.csv")
+# df = pd.read_csv("The_Truman_Show_train\\public\\transactions.csv")
+df = pd.read_csv("transactions_with_stats.csv")
 
 # Convert timestamp
 df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -67,22 +71,15 @@ df = df.merge(first_payment_method, on="sender_id", how="left")
 # -----------------------------
 # 4. Abnormal Time of Day
 # -----------------------------
-# Most common hour per sender
-sender_common_hour = (
-    df.groupby(["sender_id", "hour"])
-    .size()
-    .reset_index(name="count")
-)
+# Calculate mean hour per sender
+sender_mean_hour = df.groupby("sender_id")["hour"].mean().reset_index()
+sender_mean_hour.columns = ["sender_id", "mean_hour"]
 
-idx = sender_common_hour.groupby("sender_id")["count"].idxmax()
-common_hours = sender_common_hour.loc[idx][["sender_id", "hour"]]
-common_hours.columns = ["sender_id", "usual_hour"]
+df = df.merge(sender_mean_hour, on="sender_id", how="left")
 
-df = df.merge(common_hours, on="sender_id", how="left")
-
-# Flag if transaction happens outside +-3 hours
+# Flag if transaction happens outside ±10 hours from mean
 df["flag_abnormal_hour"] = (
-    abs(df["hour"] - df["usual_hour"]) > 3
+    abs(df["hour"] - df["mean_hour"]) > 10
 )
 
 
@@ -114,8 +111,12 @@ for sender_id in df_sorted["sender_id"].unique():
         # For sender: balance_after = previous_balance - amount (all transactions are outgoing)
         expected_balance = previous_txn["balance_after"] - current_txn["amount"]
         
-        # Flag if balance math doesn't match
-        if abs(expected_balance - current_txn["balance_after"]) > 0.01:
+        # Round to 2 decimal places to avoid floating point precision errors
+        expected_balance_rounded = round(expected_balance, 2)
+        actual_balance_rounded = round(current_txn["balance_after"], 2)
+        
+        # Flag if balance math doesn't match (allow 0.005 for rounding, which rounds to 0.01)
+        if abs(expected_balance_rounded - actual_balance_rounded) > 0.005:
             df_sorted.loc[i, "flag_balance_mismatch"] = True
         
         # Flag sequential inconsistencies (balance increased unexpectedly for outgoing txns)
@@ -204,12 +205,12 @@ df["flag_reporting_threshold"] = df["amount"].apply(is_near_threshold)
 # (sender_id + location - New or rare location)
 # -----------------------------
 # Count occurrences of each location per sender
-sender_location_freq = df[df["location"].notna()].groupby(["sender_id", "location"]).size().reset_index(name="location_count")
+sender_location_freq = df[df["transaction_location"].notna()].groupby(["sender_id", "transaction_location"]).size().reset_index(name="location_count")
 sender_location_freq["is_rare"] = sender_location_freq["location_count"] <= 1
 
 df = df.merge(
-    sender_location_freq[["sender_id", "location", "is_rare"]],
-    on=["sender_id", "location"],
+    sender_location_freq[["sender_id", "transaction_location", "is_rare"]],
+    on=["sender_id", "transaction_location"],
     how="left"
 )
 
@@ -269,11 +270,11 @@ for i in range(1, len(df)):
     
     # Only check if same sender and both have valid locations
     if (current_row["sender_id"] == previous_row["sender_id"] and
-        pd.notna(current_row["location"]) and pd.notna(previous_row["location"]) and
-        current_row["location"] in city_coordinates and previous_row["location"] in city_coordinates):
+        pd.notna(current_row["transaction_location"]) and pd.notna(previous_row["transaction_location"]) and
+        current_row["transaction_location"] in city_coordinates and previous_row["transaction_location"] in city_coordinates):
         
-        lat1, lon1 = city_coordinates[previous_row["location"]]
-        lat2, lon2 = city_coordinates[current_row["location"]]
+        lat1, lon1 = city_coordinates[previous_row["transaction_location"]]
+        lat2, lon2 = city_coordinates[current_row["transaction_location"]]
         distance = haversine_distance(lat1, lon1, lat2, lon2)
         
         # Time difference in hours
@@ -289,18 +290,18 @@ for i in range(1, len(df)):
 # (sender_id + location + payment_method - Card used in unusual place)
 # -----------------------------
 # For each sender, find common payment methods used in each location
-sender_loc_payment = df[df["location"].notna() & df["payment_method"].notna()].groupby(
-    ["sender_id", "location", "payment_method"]
+sender_loc_payment = df[df["transaction_location"].notna() & df["payment_method"].notna()].groupby(
+    ["sender_id", "transaction_location", "payment_method"]
 ).size().reset_index(name="count")
 
 # Get the most common payment method per sender/location
-sender_loc_payment_sorted = sender_loc_payment.sort_values(["sender_id", "location", "count"], ascending=[True, True, False])
-usual_payment = sender_loc_payment_sorted.drop_duplicates(["sender_id", "location"], keep="first")[["sender_id", "location", "payment_method"]]
-usual_payment.columns = ["sender_id", "location", "usual_payment_method"]
+sender_loc_payment_sorted = sender_loc_payment.sort_values(["sender_id", "transaction_location", "count"], ascending=[True, True, False])
+usual_payment = sender_loc_payment_sorted.drop_duplicates(["sender_id", "transaction_location"], keep="first")[["sender_id", "transaction_location", "payment_method"]]
+usual_payment.columns = ["sender_id", "transaction_location", "usual_payment_method"]
 
 df = df.merge(
     usual_payment,
-    on=["sender_id", "location"],
+    on=["sender_id", "transaction_location"],
     how="left"
 )
 
@@ -315,21 +316,181 @@ df["flag_unusual_location_payment"] = (
 )
 
 
-# Combined Fraud Score
-# ----
+# -----------------------------
+# 12. Amount IQR Outlier Detection
+# (Interquartile Range based outlier detection)
+# -----------------------------
+df["flag_amount_iqr_outlier"] = False
+
+for sender_id in df["sender_id"].unique():
+    sender_amounts = df[df["sender_id"] == sender_id]["amount"]
+    Q1 = sender_amounts.quantile(0.25)
+    Q3 = sender_amounts.quantile(0.75)
+    IQR = Q3 - Q1
+    
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    
+    df.loc[
+        (df["sender_id"] == sender_id) & ((df["amount"] < lower_bound) | (df["amount"] > upper_bound)),
+        "flag_amount_iqr_outlier"
+    ] = True
+
+
+# -----------------------------
+# 13. Mahalanobis Distance (Multivariate Outlier Detection)
+# (Combines amount, hour, payment_method encoded)
+# -----------------------------
+df["flag_mahalanobis_outlier"] = False
+
+# Encode categorical features
+from concurrent.futures import ThreadPoolExecutor
+payment_method_encoded = pd.factorize(df["payment_method"].fillna("unknown"))[0]
+transaction_type_encoded = pd.factorize(df["transaction_type"].fillna("unknown"))[0]
+
+# Prepare features for Mahalanobis
+features = np.column_stack([
+    df["amount"],
+    df["hour"],
+    payment_method_encoded,
+    transaction_type_encoded
+])
+
+# Standardize features
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features)
+
+# Calculate Mahalanobis distance per sender
+for sender_id in df["sender_id"].unique():
+    sender_mask = df["sender_id"] == sender_id
+    sender_features = features_scaled[sender_mask]
+    
+    if len(sender_features) > 1:
+        mean = np.mean(sender_features, axis=0)
+        try:
+            cov = np.cov(sender_features.T)
+            # Add small regularization to avoid singular matrix
+            cov += np.eye(cov.shape[0]) * 1e-6
+            inv_cov = np.linalg.inv(cov)
+            
+            # Calculate Mahalanobis distance for each transaction
+            distances = []
+            for i in range(len(sender_features)):
+                diff = sender_features[i] - mean
+                mahal_dist = np.sqrt(diff @ inv_cov @ diff.T)
+                distances.append(mahal_dist)
+            
+            # Flag if distance > 3 standard deviations
+            distances = np.array(distances)
+            threshold = np.mean(distances) + 3 * np.std(distances)
+            
+            sender_indices = df[sender_mask].index
+            for idx, dist in zip(sender_indices, distances):
+                if dist > threshold:
+                    df.loc[idx, "flag_mahalanobis_outlier"] = True
+        except:
+            pass  # Skip if covariance matrix is singular
+
+
+# -----------------------------
+# 14. Sender Transaction Description Entropy
+# (High entropy = inconsistent/random descriptions = suspicious)
+# -----------------------------
+df["flag_description_entropy"] = False
+
+if "description" in df.columns:
+    for sender_id in df["sender_id"].unique():
+        sender_desc = df[df["sender_id"] == sender_id]["description"].fillna("unknown")
+        
+        if len(sender_desc) > 1:
+            # Calculate entropy of description words
+            from collections import Counter
+            all_words = " ".join(sender_desc.astype(str)).lower().split()
+            word_counts = Counter(all_words)
+            
+            # Calculate Shannon entropy
+            total_words = len(all_words)
+            probabilities = [count / total_words for count in word_counts.values()]
+            desc_entropy = -sum(p * np.log2(p) for p in probabilities if p > 0)
+            
+            # Flag if entropy is unusually high (normalized by log of unique words)
+            max_entropy = np.log2(len(word_counts)) if len(word_counts) > 1 else 1
+            normalized_entropy = desc_entropy / max_entropy if max_entropy > 0 else 0
+            
+            # Flag if entropy > 0.7 (high variability in descriptions)
+            if normalized_entropy > 0.7:
+                df.loc[df["sender_id"] == sender_id, "flag_description_entropy"] = True
+
+
+# -----------------------------
+# 15. KL Divergence (Distribution Shift Detection)
+# (Compare recent transactions to historical baseline)
+# -----------------------------
+df["flag_kl_divergence"] = False
+
+# Use first 60% of sender's transactions as baseline
+for sender_id in df["sender_id"].unique():
+    sender_transactions = df[df["sender_id"] == sender_id].sort_values("timestamp").reset_index(drop=True)
+    
+    if len(sender_transactions) >= 10:  # Need at least 10 transactions
+        split_point = int(len(sender_transactions) * 0.6)
+        
+        baseline = sender_transactions.iloc[:split_point]
+        recent = sender_transactions.iloc[split_point:]
+        
+        # Create amount distribution bins
+        all_amounts = pd.concat([baseline["amount"], recent["amount"]])
+        bins = np.histogram_bin_edges(all_amounts, bins=10)
+        
+        # Calculate distributions
+        baseline_dist, _ = np.histogram(baseline["amount"], bins=bins)
+        baseline_dist = baseline_dist / baseline_dist.sum()
+        
+        recent_dist, _ = np.histogram(recent["amount"], bins=bins)
+        recent_dist = recent_dist / recent_dist.sum()
+        
+        # Add small epsilon to avoid log(0)
+        baseline_dist = baseline_dist + 1e-10
+        recent_dist = recent_dist + 1e-10
+        
+        # Calculate KL divergence
+        kl_div = np.sum(recent_dist * (np.log(recent_dist) - np.log(baseline_dist)))
+        
+        # Flag if KL divergence > 0.5 (significant distribution shift)
+        if kl_div > 0.5:
+            df.loc[df["sender_id"] == sender_id, "flag_kl_divergence"] = True
+
+
+# Combined Fraud Score with Weighted System
+# Weight assignments based on reliability and severity:
+# - CRITICAL (3.0): Direct evidence of manipulation/impossibility
+# - HIGH (2.0): Strong statistical indicators
+# - MEDIUM (1.5): Behavioral anomalies
+# - LOW (1.0): Weak individual indicators
+
 df["fraud_score"] = (
-    df["flag_amount_spike"].astype(int)
-    + df["flag_unusual_transaction_type"].astype(int)
-    # + df["flag_new_payment_method"].astype(int)
-    + df["flag_abnormal_hour"].astype(int)
-    + df["flag_balance_mismatch"].astype(int)
-    + df["flag_sequential_inconsistency"].astype(int)
-    + df["flag_duplicate_transactions"].astype(int)
-    + df["flag_rapid_small_transfers"].astype(int)
-    + df["flag_reporting_threshold"].astype(int)
-    + df["flag_new_rare_location"].astype(int)
-    + df["flag_impossible_travel"].astype(int)
-    + df["flag_unusual_location_payment"].astype(int)
+    # CRITICAL WEIGHT (3.0) - Direct evidence of manipulation or physical impossibility
+    df["flag_balance_mismatch"].astype(float) * 3.0           # Account math doesn't add up - manipulation
+    + df["flag_sequential_inconsistency"].astype(float) * 3.0  # Balance increased on outgoing - impossible
+    + df["flag_impossible_travel"].astype(float) * 3.0         # Physical impossibility - strong evidence
+    + df["flag_duplicate_transactions"].astype(float) * 3.0    # Exact duplicate - suspicious pattern
+    
+    # HIGH WEIGHT (2.0) - Strong statistical/behavioral indicators
+    + df["flag_amount_spike"].astype(float) * 2.0              # Significant deviation from normal
+    + df["flag_amount_iqr_outlier"].astype(float) * 2.0        # Outlier by quartile analysis
+    + df["flag_mahalanobis_outlier"].astype(float) * 2.0       # Multivariate anomaly
+    + df["flag_reporting_threshold"].astype(float) * 2.0       # Classic structuring pattern
+    + df["flag_rapid_small_transfers"].astype(float) * 2.0     # Smurfing indicator
+    + df["flag_kl_divergence"].astype(float) * 2.0             # Distribution shift (account compromise)
+    
+    # MEDIUM WEIGHT (1.5) - Behavioral anomalies
+    + df["flag_new_rare_location"].astype(float) * 1.5         # New location (could be legitimate travel)
+    + df["flag_unusual_location_payment"].astype(float) * 1.5  # Unusual payment method combo
+    + df["flag_description_entropy"].astype(float) * 1.5       # Varied descriptions (weak indicator)
+    
+    # LOW WEIGHT (1.0) - Weak individual indicators
+    + df["flag_unusual_transaction_type"].astype(float) * 1.0  # People change transaction types
+    + df["flag_abnormal_hour"].astype(float) * 1.0             # Schedules vary legitimately
 )
 # Create fraud reason column
 fraud_reasons = []
@@ -359,12 +520,22 @@ for idx, row in df.iterrows():
         reasons.append("Impossible Travel")
     if row["flag_unusual_location_payment"]:
         reasons.append("Unusual Location-Payment Combo")
+    if row["flag_amount_iqr_outlier"]:
+        reasons.append("Amount IQR Outlier")
+    if row["flag_mahalanobis_outlier"]:
+        reasons.append("Mahalanobis Outlier")
+    if row["flag_description_entropy"]:
+        reasons.append("High Description Entropy")
+    if row["flag_kl_divergence"]:
+        reasons.append("KL Divergence Distribution Shift")
     
     fraud_reasons.append(" | ".join(reasons) if reasons else "None")
 
 df["fraud_reason"] = fraud_reasons
-# Flag as suspicious if score >= 2
-df["flag_suspicious"] = df["fraud_score"] >= 2
+# Flag as suspicious if weighted score >= 6
+# Score scale: ~30 max (4 critical @ 3 + 6 high @ 2 + 3 medium @ 1.5 + 2 low @ 1)
+# Threshold of 6 = approximately 2 critical flags or equivalent combination
+df["flag_suspicious"] = df["fraud_score"] >= 6
 
 # Drop intermediate column
 if "usual_payment_method" in df.columns:
@@ -386,10 +557,43 @@ print(f"Total transactions: {total_count}")
 print(f"Fraudulent transactions: {fraud_count}")
 print(f"Fraud percentage: {fraud_percentage:.2f}%")
 
+# Threshold Variance Analysis
+print(f"\nThreshold Variance Analysis (Weighted Scoring):")
+print(f"{'Threshold':<12} {'Flagged':<12} {'Percentage':<12} {'Interpretation':<30}")
+print("-" * 66)
+thresholds_with_labels = [
+    (2, "Very Permissive"),
+    (4, "Permissive"),
+    (6, "Recommended"),
+    (8, "Moderate"),
+    (10, "Conservative"),
+    (12, "Very Conservative")
+]
+for threshold, label in thresholds_with_labels:
+    flagged_count = (df["fraud_score"] >= threshold).sum()
+    pct = (flagged_count / total_count) * 100
+    print(f"{threshold:<12} {flagged_count:<12} {pct:>10.2f}%     {label:<30}")
+
 
 # Create detailed JSON with stack traces for fraudulent transactions
 import json
 from datetime import datetime
+
+# Helper function to convert non-serializable types to JSON-compatible types
+def convert_to_serializable(obj):
+    """Convert pandas/numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    elif hasattr(obj, 'item'):  # numpy/pandas scalar types
+        return obj.item()
+    elif isinstance(obj, (np.bool_, np.integer, np.floating)):
+        return obj.item()
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
 
 fraud_stack_traces = []
 
@@ -404,7 +608,7 @@ for idx, row in fraudulent_transactions.iterrows():
         "recipient_id": row["recipient_id"],
         "amount": float(row["amount"]),
         "timestamp": row["timestamp"].isoformat(),
-        "location": row["location"] if pd.notna(row["location"]) else None,
+        "location": row["transaction_location"] if pd.notna(row["transaction_location"]) else None,
         "payment_method": row["payment_method"] if pd.notna(row["payment_method"]) else None,
         "fraud_flags": []
     }
@@ -443,10 +647,11 @@ for idx, row in fraudulent_transactions.iterrows():
             "flag": "Abnormal Time of Day",
             "description": "Transaction at unusual hour for this sender",
             "evidence": {
-                "sender_usual_hour": int(row["usual_hour"]),
+                "sender_mean_hour": round(float(row["mean_hour"]), 2),
                 "transaction_hour": int(row["hour"]),
-                "hour_difference": int(abs(row["hour"] - row["usual_hour"])),
-                "time_deviation": f"{int(abs(row['hour'] - row['usual_hour']))} hours away from typical time"
+                "hour_difference": round(abs(row["hour"] - row["mean_hour"]), 2),
+                "time_deviation": f"{round(abs(row['hour'] - row['mean_hour']), 2)} hours away from sender's mean transaction time",
+                "threshold": "More than 10 hours"
             }
         })
     
@@ -460,17 +665,17 @@ for idx, row in fraudulent_transactions.iterrows():
         current_position = sender_txns.index.get_loc(current_idx_in_sorted)
         if current_position > 0:
             prev_txn = sender_txns.iloc[current_position - 1]
-            expected_balance = float(prev_txn["balance_after"] - row["amount"])
-            actual_balance = float(row["balance_after"])
-            discrepancy = actual_balance - expected_balance
+            expected_balance = round(float(prev_txn["balance_after"] - row["amount"]), 2)
+            actual_balance = round(float(row["balance_after"]), 2)
+            discrepancy = round(actual_balance - expected_balance, 2)
             
             stack_trace["fraud_flags"].append({
                 "flag": "Balance Math Mismatch",
                 "description": "Account balance does not match expected value after transaction",
                 "evidence": {
-                    "previous_balance": float(prev_txn["balance_after"]),
-                    "transaction_amount": float(row["amount"]),
-                    "expected_calculation": f"{float(prev_txn['balance_after']):.2f} - {float(row['amount']):.2f}",
+                    "previous_balance": round(float(prev_txn["balance_after"]), 2),
+                    "transaction_amount": round(float(row["amount"]), 2),
+                    "expected_calculation": f"{round(float(prev_txn['balance_after']), 2):.2f} - {round(float(row['amount']), 2):.2f}",
                     "expected_balance": expected_balance,
                     "reported_balance": actual_balance,
                     "discrepancy": discrepancy,
@@ -494,14 +699,16 @@ for idx, row in fraudulent_transactions.iterrows():
         current_position = sender_txns.index.get_loc(current_idx_in_sorted)
         if current_position > 0:
             prev_txn = sender_txns.iloc[current_position - 1]
-            balance_change = float(row["balance_after"] - prev_txn["balance_after"])
+            prev_balance = round(float(prev_txn["balance_after"]), 2)
+            curr_balance = round(float(row["balance_after"]), 2)
+            balance_change = round(curr_balance - prev_balance, 2)
             
             stack_trace["fraud_flags"].append({
                 "flag": "Sequential Inconsistency",
                 "description": "Account balance increased unexpectedly in outgoing transaction",
                 "evidence": {
-                    "previous_balance": float(prev_txn["balance_after"]),
-                    "current_balance": float(row["balance_after"]),
+                    "previous_balance": prev_balance,
+                    "current_balance": curr_balance,
                     "balance_change": balance_change,
                     "expected": "Balance should decrease (be negative)",
                     "actual": f"Balance increased by {balance_change:.2f}",
@@ -532,7 +739,7 @@ for idx, row in fraudulent_transactions.iterrows():
                 "recipient_id": row["recipient_id"],
                 "amount": float(row["amount"]),
                 "duplicate_count": len(duplicates),
-                "matching_transactions": duplicates.to_dict(orient="records")
+                "matching_transactions": convert_to_serializable(duplicates.to_dict(orient="records"))
             }
         })
     
@@ -563,7 +770,7 @@ for idx, row in fraudulent_transactions.iterrows():
                 "small_transfers_in_window": len(small_transfers_in_window),
                 "threshold": "More than 3 small transfers",
                 "pattern": "Structuring/smurfing - breaking down large amounts",
-                "transfers": small_transfers_in_window.to_dict(orient="records")
+                "transfers": convert_to_serializable(small_transfers_in_window.to_dict(orient="records"))
             }
         })
     
@@ -591,13 +798,13 @@ for idx, row in fraudulent_transactions.iterrows():
     
     # 9. New/Rare Location
     if row["flag_new_rare_location"]:
-        sender_location_count = len(df[(df["sender_id"] == row["sender_id"]) & (df["location"] == row["location"])])
+        sender_location_count = len(df[(df["sender_id"] == row["sender_id"]) & (df["transaction_location"] == row["transaction_location"])])
         
         stack_trace["fraud_flags"].append({
             "flag": "New/Rare Location",
             "description": "Transaction at new or rarely-used location for this sender",
             "evidence": {
-                "location": row["location"],
+                "location": row["transaction_location"],
                 "times_used_by_sender": sender_location_count,
                 "threshold": "1 (new/first time)",
                 "is_first_time": sender_location_count == 1,
@@ -619,11 +826,11 @@ for idx, row in fraudulent_transactions.iterrows():
         
         if current_position > 0:
             prev_txn = sender_txns.iloc[current_position - 1]
-            previous_location = prev_txn["location"] if pd.notna(prev_txn["location"]) else None
+            previous_location = prev_txn["transaction_location"] if pd.notna(prev_txn["transaction_location"]) else None
             
-            if previous_location and previous_location in city_coordinates and row["location"] in city_coordinates:
+            if previous_location and previous_location in city_coordinates and row["transaction_location"] in city_coordinates:
                 lat1, lon1 = city_coordinates[previous_location]
-                lat2, lon2 = city_coordinates[row["location"]]
+                lat2, lon2 = city_coordinates[row["transaction_location"]]
                 distance = haversine_distance(lat1, lon1, lat2, lon2)
                 time_diff = (row["timestamp"] - prev_txn["timestamp"]).total_seconds() / 3600
                 required_speed = distance / time_diff if time_diff > 0 else float('inf')
@@ -633,7 +840,7 @@ for idx, row in fraudulent_transactions.iterrows():
             "description": "Sender would need to travel impossibly fast between locations",
             "evidence": {
                 "previous_location": previous_location,
-                "current_location": row["location"],
+                "current_location": row["transaction_location"],
                 "distance_km": round(distance, 2) if distance else None,
                 "time_difference_hours": round(time_diff, 2) if time_diff else None,
                 "required_speed_kmh": round(required_speed, 2) if required_speed else None,
@@ -648,7 +855,7 @@ for idx, row in fraudulent_transactions.iterrows():
         # Find all transactions at this location for this sender
         sender_loc_txns = df[
             (df["sender_id"] == row["sender_id"]) &
-            (df["location"] == row["location"]) &
+            (df["transaction_location"] == row["transaction_location"]) &
             (df["payment_method"].notna())
         ]["payment_method"].value_counts()
         
@@ -660,12 +867,75 @@ for idx, row in fraudulent_transactions.iterrows():
             "flag": "Unusual Location-Payment Combination",
             "description": "Different payment method used at this location than usual",
             "evidence": {
-                "location": row["location"],
+                "location": row["transaction_location"],
                 "used_payment_method": row["payment_method"],
                 "usual_payment_method": usual_payment_at_location,
                 "usual_method_usage_count": int(usage_count),
-                "payment_methods_at_location": sender_loc_txns.to_dict(),
-                "mismatch": f"Sender typically uses {usual_payment_at_location} at {row['location']}, but used {row['payment_method']} this time"
+                "payment_methods_at_location": convert_to_serializable(sender_loc_txns.to_dict()),
+                "mismatch": f"Sender typically uses {usual_payment_at_location} at {row['transaction_location']}, but used {row['payment_method']} this time"
+            }
+        })
+    
+    # 12. Amount IQR Outlier
+    if row["flag_amount_iqr_outlier"]:
+        sender_amounts = df[df["sender_id"] == row["sender_id"]]["amount"]
+        Q1 = sender_amounts.quantile(0.25)
+        Q3 = sender_amounts.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        stack_trace["fraud_flags"].append({
+            "flag": "Amount IQR Outlier",
+            "description": "Transaction amount falls outside the Interquartile Range (IQR)",
+            "evidence": {
+                "transaction_amount": round(float(row["amount"]), 2),
+                "Q1": round(Q1, 2),
+                "Q3": round(Q3, 2),
+                "IQR": round(IQR, 2),
+                "lower_bound": round(lower_bound, 2),
+                "upper_bound": round(upper_bound, 2),
+                "is_below_lower": float(row["amount"]) < lower_bound,
+                "is_above_upper": float(row["amount"]) > upper_bound,
+                "pattern": "Transaction amount deviates significantly from sender's typical range"
+            }
+        })
+    
+    # 13. Mahalanobis Distance Outlier
+    if row["flag_mahalanobis_outlier"]:
+        stack_trace["fraud_flags"].append({
+            "flag": "Mahalanobis Outlier",
+            "description": "Multivariate outlier: unusual combination of amount, hour, payment method, and transaction type",
+            "evidence": {
+                "amount": round(float(row["amount"]), 2),
+                "hour": int(row["hour"]),
+                "payment_method": row["payment_method"],
+                "transaction_type": row["transaction_type"],
+                "pattern": "Unusual in combination, though individual features may seem normal"
+            }
+        })
+    
+    # 14. Description Entropy Outlier
+    if row["flag_description_entropy"]:
+        stack_trace["fraud_flags"].append({
+            "flag": "High Description Entropy",
+            "description": "Transaction descriptions show high randomness/variability for this sender",
+            "evidence": {
+                "description": row["description"] if pd.notna(row["description"]) else "N/A",
+                "pattern": "Inconsistent/random descriptions suggest unauthorized activity",
+                "note": "Legitimate senders typically use consistent description patterns"
+            }
+        })
+    
+    # 15. KL Divergence Distribution Shift
+    if row["flag_kl_divergence"]:
+        stack_trace["fraud_flags"].append({
+            "flag": "KL Divergence Distribution Shift",
+            "description": "Recent transaction distribution differs significantly from historical baseline",
+            "evidence": {
+                "amount": round(float(row["amount"]), 2),
+                "pattern": "Recent transactions show different distribution than sender's historical behavior",
+                "note": "May indicate account compromise or unauthorized user activity"
             }
         })
     
@@ -674,11 +944,11 @@ for idx, row in fraudulent_transactions.iterrows():
 # Save to JSON file
 output_file = "fraud_stack_traces.json"
 with open(output_file, "w", encoding="utf-8") as f:
-    json.dump({
+    json.dump(convert_to_serializable({
         "generated_at": datetime.now().isoformat(),
         "total_fraudulent_transactions": len(fraud_stack_traces),
         "fraud_percentage": round(fraud_percentage, 2),
         "fraudulent_transactions": fraud_stack_traces
-    }, f, indent=2, ensure_ascii=False)
+    }), f, indent=2, ensure_ascii=False)
 
 print(f"\nDetailed fraud stack traces saved to: {output_file}")
