@@ -45,36 +45,21 @@ logging.basicConfig(
 log = logging.getLogger("run_pipeline")
 
 # ---------------------------------------------------------------------------
-# Langfuse setup (shared session)
+# Session ID generation
+# The Langfuse client lives in agent4_llm_decision (module-level, tutorial pattern).
+# The pipeline only needs to generate the shared session_id.
 # ---------------------------------------------------------------------------
 try:
     import ulid
-    from langfuse import Langfuse, observe
-    from langfuse.langchain import CallbackHandler
-    _LANGFUSE_AVAILABLE = True
+    _ULID_AVAILABLE = True
 except ImportError:
-    _LANGFUSE_AVAILABLE = False
-    log.warning("Langfuse not available — install with: pip install langfuse ulid-py")
-
-
-def _init_langfuse():
-    if not _LANGFUSE_AVAILABLE:
-        return None
-    try:
-        client = Langfuse(
-            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-            host=os.getenv("LANGFUSE_HOST", "https://challenges.reply.com/langfuse"),
-        )
-        return client
-    except Exception as e:
-        log.warning(f"Could not init Langfuse: {e}")
-        return None
+    _ULID_AVAILABLE = False
 
 
 def generate_session_id() -> str:
+    """Generate {TEAM_NAME}-{ULID} session ID — tutorial format."""
     team = os.getenv("TEAM_NAME", "team")
-    if _LANGFUSE_AVAILABLE:
+    if _ULID_AVAILABLE:
         return f"{team}-{ulid.new().str}"
     import uuid
     return f"{team}-{uuid.uuid4().hex[:20].upper()}"
@@ -148,17 +133,23 @@ def run_pipeline(
         The session_id used for Langfuse tracking.
     """
 
-    langfuse_client = _init_langfuse()
-
-    # One session ID for the entire pipeline run
+    # One session ID shared across the whole pipeline
+    # agent4 will use it internally and tag every Langfuse trace with it
     sid = session_id or generate_session_id()
+
+    # Expose via env so agent4's module-level client can pick it up if needed
+    os.environ["PIPELINE_SESSION_ID"] = sid
+
+    # Reuse the module-level langfuse_client and flag already imported by agent4
+    from agent4_llm_decision import langfuse_client as _lf_client
+    from agent4_llm_decision import _LANGFUSE_AVAILABLE
 
     _banner("REPLY MIRROR – Fraud Detection Pipeline")
     log.info(f"  Dataset    : {dataset_dir}")
     log.info(f"  Session ID : {sid}")
     log.info(f"  Top-N      : {top_n}")
     log.info(f"  LLM thresh : {threshold}")
-    log.info(f"  Langfuse   : {'enabled' if langfuse_client else 'disabled'}")
+    log.info(f"  Langfuse   : {'enabled' if _LANGFUSE_AVAILABLE else 'disabled'}")
     print()
 
     # -----------------------------------------------------------------------
@@ -211,24 +202,26 @@ def run_pipeline(
     fraud_ids = _run_with_timing("Agent 4 – LLM Decision", _run_llm_decision)
 
     # -----------------------------------------------------------------------
-    # Flush Langfuse and print final summary
+    # Final flush — agent4 already calls flush(), this is a safety net
     # -----------------------------------------------------------------------
-    if langfuse_client:
-        langfuse_client.flush()
-        log.info("Langfuse traces flushed.")
+    if _LANGFUSE_AVAILABLE and _lf_client is not None:
+        try:
+            _lf_client.flush()
+        except Exception:
+            pass
 
     submission_path = Path(dataset_dir) / "submission.txt"
     _banner("Pipeline Complete")
     log.info(f"  Session ID     : {sid}")
     log.info(f"  Fraudulent txs : {len(fraud_ids) if fraud_ids else 0}")
     log.info(f"  Submission     : {submission_path}")
-    if langfuse_client:
+    if _LANGFUSE_AVAILABLE:
         log.info(f"  Langfuse host  : {os.getenv('LANGFUSE_HOST', 'N/A')}")
     print()
 
     # Print Langfuse trace info if available
-    if langfuse_client and _LANGFUSE_AVAILABLE:
-        _print_trace_info(langfuse_client, sid)
+    if _LANGFUSE_AVAILABLE and _lf_client is not None:
+        _print_trace_info(_lf_client, sid)
 
     return sid
 
@@ -254,8 +247,25 @@ def _print_trace_info(langfuse_client, session_id: str) -> None:
             page += 1
 
         if not traces:
-            log.info(f"No traces found for session {session_id} yet (may take a moment to propagate).")
-            return
+            # Langfuse propagation can take a few seconds — retry up to 3 times
+            import time as _time
+            for _retry in range(3):
+                _time.sleep(5)
+                log.info(f"  Waiting for Langfuse propagation… (attempt {_retry + 2}/4)")
+                page, traces = 1, []
+                while True:
+                    resp2 = langfuse_client.api.trace.list(session_id=session_id, limit=100, page=page)
+                    if not resp2.data:
+                        break
+                    traces.extend(resp2.data)
+                    if len(resp2.data) < 100:
+                        break
+                    page += 1
+                if traces:
+                    break
+            if not traces:
+                log.info(f"Session {session_id} not yet indexed — check the dashboard in ~1 min.")
+                return
 
         observations = []
         for trace in traces:

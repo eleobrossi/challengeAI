@@ -1,8 +1,10 @@
 langfuse==3.6.2
-langchain
-langchain-openai
+langchain==0.3.25
+langchain-openai==0.3.14
 python-dotenv
 ulid-py
 pandas
 numpy
 matplotlib
+networkx
+scikit-learn
