@@ -1,0 +1,8 @@
+langfuse==3.6.2
+langchain
+langchain-openai
+python-dotenv
+ulid-py
+pandas
+numpy
+matplotlib

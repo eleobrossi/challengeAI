@@ -1,0 +1,13 @@
+{
+  "dataset_dir": "datasets/level_1",
+  "n_transactions": 125,
+  "n_users": 5,
+  "n_locations": 1379,
+  "n_sms": 270,
+  "n_mails": 13,
+  "n_unique_senders": 10,
+  "n_unique_recipients": 14,
+  "n_salary_candidates": 10,
+  "graph_nodes": 19,
+  "graph_edges": 15
+}

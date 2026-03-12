@@ -1,0 +1,14 @@
+metric,value
+amount_mean,1575.63608
+amount_median,934.46
+amount_p95,3135.456
+amount_p99,3156.8316
+amount_outlier_iqr_frac,0.0
+night_tx_frac_00_06,0.0
+sender_count_mean,12.5
+sender_count_p95,13.0
+recipient_count_mean,8.928571428571429
+recipient_count_p95,12.0
+payment_type::transfer,121.0
+payment_type::direct debit,3.0
+payment_type::e-commerce,1.0

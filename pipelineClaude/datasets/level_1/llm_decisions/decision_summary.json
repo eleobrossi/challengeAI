@@ -1,0 +1,8 @@
+{
+  "session_id": "BiancaSalaArguziaInnaturale-01KKHJK7ZMYA1HFXYB9YHXZ8X1",
+  "n_candidates": 52,
+  "n_flagged_by_llm": 24,
+  "n_total_in_dataset": 125,
+  "threshold_used": 0.3,
+  "flagged_fraction": 0.192
+}

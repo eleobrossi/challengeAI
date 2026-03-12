@@ -1,0 +1,12 @@
+{
+  "dataset_dir": "datasets/level_1",
+  "n_transactions": 125,
+  "n_senders": 10,
+  "n_recipients": 14,
+  "n_sender_profiles": 10,
+  "n_recipient_profiles": 14,
+  "n_pair_profiles": 15,
+  "n_salary_profiles": 10,
+  "n_message_events": 283,
+  "n_feature_columns": 164
+}
